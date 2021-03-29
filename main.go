@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -75,4 +78,70 @@ func check(err error) {
 		fmt.Println(err.Error())
 		os.Exit(1)
 	}
+}
+
+type Version struct {
+	Active bool `json:"active"`
+	Number int  `json:"number"`
+}
+
+func getActiveService(serviceID, fastlyKey string) (int, error) {
+	reqURL := fmt.Sprintf("/service/%s/version", serviceID)
+	body, err := fastlyHTTP(reqURL, http.MethodGet, fastlyKey, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	var data []Version
+	err = json.Unmarshal(body, &data)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, version := range data {
+		if version.Active {
+			return version.Number, nil
+		}
+	}
+
+	return 0, errors.New("No active version found.")
+}
+
+func cloneService(serviceID, versionID, fastlyKey string) (int, error) {
+	reqURL := fmt.Sprintf("/service/%s/version/%s/clone", serviceID, versionID)
+	body, err := fastlyHTTP(reqURL, http.MethodPut, fastlyKey, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	var data Version
+	err = json.Unmarshal(body, &data)
+	return data.Number, err
+}
+
+func activateService(serviceID, versionID, fastlyKey string) error {
+	reqURL := fmt.Sprintf("/service/%s/version/%s/activate", serviceID, versionID)
+	_, err := fastlyHTTP(reqURL, http.MethodPut, fastlyKey, nil)
+	return err
+}
+
+func fastlyHTTP(reqURL string, method string, fastlyKey string, reqBody io.Reader) ([]byte, error) {
+	req, err := http.NewRequest(method, reqURL, reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Fastly-Key", fastlyKey)
+	req.Header.Add("Accept", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	return body, err
 }
