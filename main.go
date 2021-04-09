@@ -8,9 +8,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
-	"net/url"
 	"os"
-	"strings"
 )
 
 // https://developer.fastly.com/reference/api/logging/s3/
@@ -32,30 +30,19 @@ func main() {
 	checkArg("AWS_SECRET_KEY", awsSecretKey)
 	checkArg("FASTLY_KEY", fastlyKey)
 
-	reqURL := url.URL{
-		Scheme: "https",
-		Host:   "api.fastly.com",
-		Path:   fmt.Sprintf("/service/%s/version/1/logging/s3/%s", *serviceID, *loggingName),
-	}
+	var err error
+	activeVersion, err := getActiveService(*serviceID, fastlyKey)
+	check(err)
+	println(activeVersion)
 
-	form := url.Values{"access_key": {*awsAccessKey}, "secret_key": {awsSecretKey}}
-	req, err := http.NewRequest(http.MethodPut, reqURL.String(), strings.NewReader(form.Encode()))
+	newVersion, err := cloneService(*serviceID, activeVersion, fastlyKey)
+	check(err)
+	println(newVersion)
+
+	err = updateLoggingCreds(*serviceID, newVersion, *loggingName, fastlyKey)
 	check(err)
 
-	req.Header.Add("Fastly-Key", fastlyKey)
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Add("Accept", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	check(err)
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		check(fmt.Errorf("Update request failed: %d, %s", resp.StatusCode, string(body)))
-	}
-
+	err = activateService(*serviceID, newVersion, fastlyKey)
 }
 
 func usage() {
@@ -107,8 +94,8 @@ func getActiveService(serviceID, fastlyKey string) (int, error) {
 	return 0, errors.New("No active version found.")
 }
 
-func cloneService(serviceID, versionID, fastlyKey string) (int, error) {
-	reqURL := fmt.Sprintf("/service/%s/version/%s/clone", serviceID, versionID)
+func cloneService(serviceID string, versionID int, fastlyKey string) (int, error) {
+	reqURL := fmt.Sprintf("/service/%s/version/%d/clone", serviceID, versionID)
 	body, err := fastlyHTTP(reqURL, http.MethodPut, fastlyKey, nil)
 	if err != nil {
 		return 0, err
@@ -119,13 +106,20 @@ func cloneService(serviceID, versionID, fastlyKey string) (int, error) {
 	return data.Number, err
 }
 
-func activateService(serviceID, versionID, fastlyKey string) error {
-	reqURL := fmt.Sprintf("/service/%s/version/%s/activate", serviceID, versionID)
+func updateLoggingCreds(serviceID string, versionID int, loggingName string, fastlyKey string) error {
+	reqURL := fmt.Sprintf("/service/%s/version/%d/logging/s3/%s", serviceID, versionID, loggingName)
 	_, err := fastlyHTTP(reqURL, http.MethodPut, fastlyKey, nil)
 	return err
 }
 
-func fastlyHTTP(reqURL string, method string, fastlyKey string, reqBody io.Reader) ([]byte, error) {
+func activateService(serviceID string, versionID int, fastlyKey string) error {
+	reqURL := fmt.Sprintf("/service/%s/version/%d/activate", serviceID, versionID)
+	_, err := fastlyHTTP(reqURL, http.MethodPut, fastlyKey, nil)
+	return err
+}
+
+func fastlyHTTP(path string, method string, fastlyKey string, reqBody io.Reader) ([]byte, error) {
+	reqURL := "https://api.fastly.com" + path
 	req, err := http.NewRequest(method, reqURL, reqBody)
 	if err != nil {
 		return nil, err
@@ -141,7 +135,14 @@ func fastlyHTTP(reqURL string, method string, fastlyKey string, reqBody io.Reade
 	}
 
 	defer resp.Body.Close()
-
 	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Fastly API request for '%s' failed: %d, %s", reqURL, resp.StatusCode, string(body))
+	}
+
 	return body, err
 }
