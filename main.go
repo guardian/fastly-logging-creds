@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -8,41 +9,81 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 )
 
 // https://developer.fastly.com/reference/api/logging/s3/
 func main() {
-
 	serviceID := flag.String("serviceID", "", "A Fastly Service ID.")
-	loggingName := flag.String("loggingName", "", "Name of your service logging configuration in Fastly.")
 	awsAccessKey := flag.String("awsAccessKey", "", "AWS Access Key for S3 write access to the target bucket.")
+	loggingName := flag.String("loggingName", "s3-logs", "Name of your service logging configuration in Fastly.")
 
-	flag.Usage = usage // customise help/error messages
-	flag.Parse()
+	flag.Usage = usage
+	flag.CommandLine.Parse(os.Args[2:]) // first arg is command
+	checkArgs()
 
 	awsSecretKey := os.Getenv("AWS_SECRET_KEY")
 	fastlyKey := os.Getenv("FASTLY_KEY")
 
-	checkArg("serviceID", *serviceID)
-	checkArg("loggingName", *loggingName)
-	checkArg("awsAccessKey", *awsAccessKey)
-	checkArg("AWS_SECRET_KEY", awsSecretKey)
-	checkArg("FASTLY_KEY", fastlyKey)
+	switch os.Args[1] {
+	case "rotate-creds":
+		rotateCreds(fastlyKey, *serviceID, *loggingName, *awsAccessKey, awsSecretKey)
+	case "describe":
+		describeLogs(fastlyKey, *serviceID)
+	case "delete":
+		deleteLogs(fastlyKey, *serviceID)
+	case "create":
+		createLogs(fastlyKey, *serviceID, *awsAccessKey, awsSecretKey)
+	default:
+		check(errors.New("Must provide valid command. See -h for more info."))
+	}
+}
 
-	var err error
-	activeVersion, err := getActiveService(*serviceID, fastlyKey)
+func rotateCreds(fastlyKey, serviceID, loggingName, awsAccessKey, awsSecretKey string) {
+	err := updateService(fastlyKey, serviceID, func(versionID int) error {
+		return updateLoggingCreds(serviceID, versionID, loggingName, fastlyKey, awsAccessKey, awsSecretKey)
+	})
 	check(err)
-	println(activeVersion)
+}
 
-	newVersion, err := cloneService(*serviceID, activeVersion, fastlyKey)
+func describeLogs(fastlyKey, serviceID string) {
+	err := updateService(fastlyKey, serviceID, func(versionID int) error {
+		data, err := getLogConfiguration(serviceID, versionID, fastlyKey)
+		if err != nil {
+			return err
+		}
+
+		var buf bytes.Buffer
+		json.Indent(&buf, data, "", "    ")
+		fmt.Println(buf.String())
+		return nil
+	})
 	check(err)
-	println(newVersion)
+}
 
-	err = updateLoggingCreds(*serviceID, newVersion, *loggingName, fastlyKey)
+func deleteLogs(fastlyKey, serviceID string) {
+	err := updateService(fastlyKey, serviceID, func(versionID int) error {
+		return deleteLogConfiguration(serviceID, versionID, fastlyKey)
+	})
 	check(err)
+}
 
-	err = activateService(*serviceID, newVersion, fastlyKey)
+func createLogs(fastlyKey, serviceID, awsAccessKey, awsSecretKey string) {
+	err := updateService(fastlyKey, serviceID, func(versionID int) error {
+		return createLogConfiguration(serviceID, versionID, fastlyKey, awsAccessKey, awsSecretKey)
+	})
+	check(err)
+}
+
+func checkArgs() {
+	flag.VisitAll(func(f *flag.Flag) {
+		if f.Value.String() == "" {
+			fmt.Printf("Missing required arg '%s'.\n", f.Name)
+			os.Exit(1)
+		}
+	})
 }
 
 func usage() {
@@ -51,13 +92,6 @@ func usage() {
 	flag.PrintDefaults()
 	fmt.Fprintln(flag.CommandLine.Output())
 	fmt.Fprint(flag.CommandLine.Output(), "Note, AWS_SECRET_KEY and FASTLY_KEY must be provided as env vars.\n")
-}
-
-func checkArg(name, value string) {
-	if value == "" {
-		fmt.Printf("Missing required arg '%s'.\n", name)
-		os.Exit(1)
-	}
 }
 
 func check(err error) {
@@ -70,6 +104,26 @@ func check(err error) {
 type Version struct {
 	Active bool `json:"active"`
 	Number int  `json:"number"`
+}
+
+func updateService(fastlyKey, serviceID string, fn func(versionID int) error) error {
+	var err error
+	activeVersion, err := getActiveService(serviceID, fastlyKey)
+	if err != nil {
+		return err
+	}
+
+	newVersion, err := cloneService(serviceID, activeVersion, fastlyKey)
+	if err != nil {
+		return err
+	}
+
+	err = fn(newVersion)
+	if err != nil {
+		return err
+	}
+
+	return activateService(serviceID, newVersion, fastlyKey)
 }
 
 func getActiveService(serviceID, fastlyKey string) (int, error) {
@@ -106,10 +160,60 @@ func cloneService(serviceID string, versionID int, fastlyKey string) (int, error
 	return data.Number, err
 }
 
-func updateLoggingCreds(serviceID string, versionID int, loggingName string, fastlyKey string) error {
+func updateLoggingCreds(serviceID string, versionID int, loggingName string, fastlyKey string, awsAccessKey string, awsSecretKey string) error {
 	reqURL := fmt.Sprintf("/service/%s/version/%d/logging/s3/%s", serviceID, versionID, loggingName)
-	_, err := fastlyHTTP(reqURL, http.MethodPut, fastlyKey, nil)
+	form := url.Values{"access_key": {awsAccessKey}, "secret_key": {awsSecretKey}}
+	body := strings.NewReader(form.Encode())
+	_, err := fastlyHTTP(reqURL, http.MethodPut, fastlyKey, body)
 	return err
+}
+
+func createLogConfiguration(serviceID string, versionID int, fastlyKey string, awsAccessKey string, awsSecretKey string) error {
+	reqURL := fmt.Sprintf("/service/%s/version/%d/logging/s3", serviceID, versionID)
+	form := url.Values{
+		"name":        {"s3-logs"},
+		"access_key":  {awsAccessKey},
+		"secret_key":  {awsSecretKey},
+		"bucket_name": {"aws-frontend-logs"},
+		"path":        {"/fastly/" + serviceID},
+	}
+
+	body := strings.NewReader(form.Encode())
+	_, err := fastlyHTTP(reqURL, http.MethodPost, fastlyKey, body)
+	return err
+}
+
+func getLogConfiguration(serviceID string, versionID int, fastlyKey string) ([]byte, error) {
+	reqURL := fmt.Sprintf("/service/%s/version/%d/logging/s3", serviceID, versionID)
+	body, err := fastlyHTTP(reqURL, http.MethodGet, fastlyKey, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return body, nil
+}
+
+func deleteLogConfiguration(serviceID string, versionID int, fastlyKey string) error {
+	data, err := getLogConfiguration(serviceID, versionID, fastlyKey)
+	if err != nil {
+		return err
+	}
+
+	var confs []map[string]string
+	err = json.Unmarshal(data, &confs)
+	if err != nil {
+		return err
+	}
+
+	for _, c := range confs {
+		reqURL := fmt.Sprintf("/service/%s/version/%d/logging/s3/%s", serviceID, versionID, c["name"])
+		_, err := fastlyHTTP(reqURL, http.MethodDelete, fastlyKey, nil)
+		if err != nil {
+			return errors.New(fmt.Sprintf("Unable to delete logging service %s: %v", c["name"], err))
+		}
+	}
+
+	return nil
 }
 
 func activateService(serviceID string, versionID int, fastlyKey string) error {
